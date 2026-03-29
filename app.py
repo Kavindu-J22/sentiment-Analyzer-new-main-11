@@ -389,6 +389,39 @@ own human judgment — great for testing accuracy!</p>
         st.caption("💡 **Available Topics:** Delivery & Shipping · Fit & Size · Product Quality · Customer Service · Value for Money · Style & Design")
         st.caption("💡 **Available Sentiments:** Positive · Neutral-Positive (Mixed) · Neutral · Neutral-Negative (Mixed) · Negative")
 
+        # ── RoBERTa status indicator ──────────────────────────────────────────
+        roberta_ready = st.session_state.get('roberta_pipe') is not None
+        st.markdown("---")
+        rb_col1, rb_col2 = st.columns([3, 1])
+        with rb_col1:
+            if roberta_ready:
+                st.success("🤖 **RoBERTa Sarcasm Detector: Loaded & Ready** — sarcasm correction will be applied automatically.")
+            else:
+                st.warning(
+                    "🤖 **RoBERTa Sarcasm Detector: Not Loaded** — VADER-only mode. "
+                    "Sarcastic reviews (e.g. *'Oh I just love how it fell apart'*) may be misclassified. "
+                    "Click **Load RoBERTa** to enable sarcasm correction.")
+        with rb_col2:
+            if not roberta_ready:
+                if st.button("⬇️ Load RoBERTa", help="Downloads ~500 MB on first run, then cached"):
+                    with st.spinner("⬇️ Loading RoBERTa model (first run: 2–5 min)…"):
+                        pipe = M['load_roberta_pipeline']()
+                    if pipe:
+                        st.session_state.roberta_pipe = pipe
+                        st.success("✅ RoBERTa loaded!")
+                        st.rerun()
+                    else:
+                        st.error("❌ Load failed. Check internet & torch install.")
+            else:
+                if st.button("🔄 Reload RoBERTa"):
+                    with st.spinner("Reloading…"):
+                        pipe = M['load_roberta_pipeline']()
+                    if pipe:
+                        st.session_state.roberta_pipe = pipe
+                        st.success("✅ Reloaded!")
+                        st.rerun()
+        st.markdown("---")
+
         if st.button("🔍 Analyse Live Reviews", type="primary"):
             lines = [l.strip() for l in live_text.strip().split('\n') if l.strip()]
             exp_topics = ([l.strip() for l in exp_topics_raw.strip().split('\n') if l.strip()]
@@ -448,7 +481,11 @@ own human judgment — great for testing accuracy!</p>
                             return '✅ Match'
                     return '⚠️ Mismatch'
 
-                with st.spinner("🔄 Running Hybrid NLP Pipeline (VADER + Keyword-LDA)…"):
+                _roberta_pipe = st.session_state.get('roberta_pipe')
+                _spinner_label = ("🔄 Running Hybrid NLP Pipeline (VADER + Keyword-LDA + RoBERTa)…"
+                                  if _roberta_pipe else
+                                  "🔄 Running Hybrid NLP Pipeline (VADER + Keyword-LDA)…")
+                with st.spinner(_spinner_label):
                     temp_df = pd.DataFrame({
                         'Review Text': lines, 'Rating': 3,
                         'Department Name': 'Unknown', 'Age': 35,
@@ -456,22 +493,60 @@ own human judgment — great for testing accuracy!</p>
                         'Division Name': 'Unknown', 'Class Name': 'Unknown'})
                     vader_df = M['batch_analyze_vader'](temp_df)
 
+                    # Import detect_single for per-review RoBERTa inference
+                    from src.sarcasm_detector import detect_single, IRONY_THRESHOLD
+
                     live_records = []
                     for i, row in vader_df.iterrows():
-                        pred_topic = _predict_topic(str(row['Review Text']))
-                        pred_sent  = _predict_sentiment_label(float(row['compound']))
+                        pred_topic   = _predict_topic(str(row['Review Text']))
+                        vader_compound = float(row['compound'])
+                        vader_sent   = _predict_sentiment_label(vader_compound)
+                        dis_score    = float(row['dissatisfaction_score'])
+                        dis_class    = str(row['sentiment_class'])
+
+                        # ── RoBERTa sarcasm detection (hybrid: model + lexical boost) ──
+                        if _roberta_pipe is not None:
+                            sarcasm_result = detect_single(
+                                str(row['Review Text']), _roberta_pipe,
+                                compound=vader_compound)
+                        else:
+                            sarcasm_result = {'irony_prob': 0.0, 'non_irony_prob': 1.0,
+                                             'is_sarcastic': False, 'lexical_boost': 0.0}
+
+                        irony_prob   = sarcasm_result['irony_prob']
+                        is_sarcastic = sarcasm_result['is_sarcastic']
+
+                        # ── Sentiment override when RoBERTa catches VADER's mistake ──
+                        # If VADER says positive/neutral-positive but RoBERTa detects irony
+                        vader_misled = vader_compound > 0.1 and is_sarcastic
+                        if vader_misled:
+                            # Override: sarcastic review is truly negative
+                            pred_sent  = 'Negative (Sarcasm 🎭)'
+                            # Dissatisfaction score: irony_prob drives it (min 60 for confirmed sarcasm)
+                            dis_score  = round(max(60.0, irony_prob * 100), 1)
+                            dis_class  = 'High Dissatisfaction'
+                        else:
+                            pred_sent  = vader_sent
+
                         live_records.append({
                             'review':                str(row['Review Text']),
                             'exp_topic':             exp_topics[i] if i < len(exp_topics) else '—',
                             'exp_sentiment':         exp_sents[i]  if i < len(exp_sents)  else '—',
                             'pred_topic':            pred_topic,
+                            'vader_sentiment':       vader_sent,
                             'pred_sentiment':        pred_sent,
-                            'dissatisfaction_class': str(row['sentiment_class']),
-                            'dissatisfaction_score': float(row['dissatisfaction_score']),
-                            'compound':              float(row['compound']),
+                            'dissatisfaction_class': dis_class,
+                            'dissatisfaction_score': dis_score,
+                            'compound':              vader_compound,
                             'vader_pos':             float(row['vader_pos']),
                             'vader_neu':             float(row['vader_neu']),
                             'vader_neg':             float(row['vader_neg']),
+                            'irony_prob':            irony_prob,
+                            'roberta_irony':         sarcasm_result.get('roberta_irony', irony_prob),
+                            'lexical_boost':         sarcasm_result.get('lexical_boost', 0.0),
+                            'is_sarcastic':          is_sarcastic,
+                            'vader_misled':          vader_misled,
+                            'roberta_used':          _roberta_pipe is not None,
                         })
 
                 st.session_state.df_raw = temp_df
@@ -495,11 +570,17 @@ own human judgment — great for testing accuracy!</p>
 
             st.markdown("---")
             st.markdown("### 🔬 Live Analysis Results")
-            st.markdown(f"**{len(results)} review(s) analysed** using VADER + Keyword-based Topic Classifier")
+            _any_roberta = any(r.get('roberta_used') for r in results)
+            _engine_label = "VADER + Keyword-LDA + RoBERTa Sarcasm Correction" if _any_roberta else "VADER + Keyword-based Topic Classifier"
+            st.markdown(f"**{len(results)} review(s) analysed** using {_engine_label}")
+            if not _any_roberta:
+                st.info("💡 Load RoBERTa above to enable sarcasm detection and automatic sentiment correction.")
 
             # ── Summary comparison table ──────────────────────────────────────
             table_rows = []
             for r in results:
+                sarcasm_col = ('🎭 Sarcasm' if r.get('is_sarcastic') else
+                               ('✅ OK' if r.get('roberta_used') else '—'))
                 table_rows.append({
                     'Review (excerpt)':   (r['review'][:60]+'…' if len(r['review'])>60 else r['review']),
                     'Predicted Topic':    r['pred_topic'],
@@ -508,6 +589,7 @@ own human judgment — great for testing accuracy!</p>
                     'Predicted Sentiment':r['pred_sentiment'],
                     'Expected Sentiment': r['exp_sentiment'],
                     'Sentiment ✓':        _match_icon_display(r['exp_sentiment'], r['pred_sentiment']),
+                    'Sarcasm (RoBERTa)':  sarcasm_col,
                     'Score /100':         f"{r['dissatisfaction_score']:.1f}",
                     'Severity Class':     r['dissatisfaction_class'],
                 })
@@ -521,15 +603,28 @@ own human judgment — great for testing accuracy!</p>
                                else '#CA8A04' if score >= 20 else '#059669')
                 topic_match = _match_icon_display(r['exp_topic'],    r['pred_topic'])
                 sent_match  = _match_icon_display(r['exp_sentiment'], r['pred_sentiment'])
+                sarcasm_tag = " 🎭 SARCASM" if r.get('is_sarcastic') else ""
 
                 with st.expander(
-                    f"📄 Review {i+1}  |  Dissatisfaction: {score:.0f}/100  |  {r['dissatisfaction_class']}",
+                    f"📄 Review {i+1}  |  Dissatisfaction: {score:.0f}/100  |  {r['dissatisfaction_class']}{sarcasm_tag}",
                     expanded=(len(results) <= 4)):
                     c1, c2, c3 = st.columns([3, 2, 2])
 
                     with c1:
                         st.markdown("**📝 Full Review Text:**")
                         st.info(r['review'])
+                        # Sarcasm correction explanation
+                        if r.get('vader_misled'):
+                            st.error(
+                                f"🎭 **Sarcasm Detected!** VADER was misled by positive surface language "
+                                f"(compound = `{r['compound']:+.4f}`) and predicted **{r['vader_sentiment']}**. "
+                                f"RoBERTa irony probability = **{r['irony_prob']:.0%}** → "
+                                f"Sentiment corrected to **{r['pred_sentiment']}**.")
+                        elif r.get('is_sarcastic'):
+                            st.warning(
+                                f"🎭 **Sarcasm Detected** (irony prob = {r['irony_prob']:.0%}). "
+                                f"VADER compound `{r['compound']:+.4f}` already suggested negativity, "
+                                f"so no override was needed.")
 
                     with c2:
                         exp_t_html = (f"<br><small style='color:#64748B'>▸ Your Expected: "
@@ -538,13 +633,14 @@ own human judgment — great for testing accuracy!</p>
                         exp_s_html = (f"<br><small style='color:#64748B'>▸ Your Expected: "
                                       f"<b>{r['exp_sentiment']}</b> &nbsp; {sent_match}</small>"
                                       if r['exp_sentiment'] != '—' else "")
+                        sent_color = '#DC2626' if r.get('vader_misled') else '#4F46E5'
                         st.markdown(f"""
 **🏷️ Predicted Topic**
 <span style='font-size:1.05rem;font-weight:700;color:#4F46E5'>{r['pred_topic']}</span>
 {exp_t_html}
 
 **💬 Predicted Sentiment**
-<span style='font-size:1.05rem;font-weight:700;color:#4F46E5'>{r['pred_sentiment']}</span>
+<span style='font-size:1.05rem;font-weight:700;color:{sent_color}'>{r['pred_sentiment']}</span>
 {exp_s_html}
 
 **🏷️ Severity Class**
@@ -561,6 +657,26 @@ own human judgment — great for testing accuracy!</p>
 | 🔴 Negative | `{r['vader_neg']:.3f}` |
 | ⚡ Compound | `{r['compound']:+.4f}` |
 """)
+                        if r.get('roberta_used'):
+                            irony_bar_color = '#DC2626' if r['irony_prob'] >= 0.55 else '#059669'
+                            rob_raw  = r.get('roberta_irony', r['irony_prob'])
+                            lex_bst  = r.get('lexical_boost', 0.0)
+                            st.markdown(f"""
+**🤖 RoBERTa Hybrid Irony Score**
+
+<div style='background:#F1F5F9;border-radius:8px;padding:8px 10px;margin-bottom:6px'>
+  <div style='font-size:0.78rem;color:#64748B;margin-bottom:4px'>Combined Irony Probability</div>
+  <div style='background:#E2E8F0;border-radius:4px;height:10px;overflow:hidden'>
+    <div style='background:{irony_bar_color};width:{r["irony_prob"]*100:.0f}%;height:100%'></div>
+  </div>
+  <div style='font-size:0.9rem;font-weight:700;color:{irony_bar_color};margin-top:4px'>
+    {r["irony_prob"]:.0%} {"🎭 Sarcasm Detected" if r.get("is_sarcastic") else "✅ Genuine"}
+  </div>
+  <div style='font-size:0.72rem;color:#64748B;margin-top:4px'>
+    Model: {rob_raw:.0%} &nbsp;+&nbsp; Lexical boost: +{lex_bst:.0%}
+  </div>
+</div>
+""", unsafe_allow_html=True)
                         st.markdown(
                             f"<div style='background:{badge_color};color:#fff;padding:12px 16px;"
                             f"border-radius:10px;text-align:center;margin-top:6px;'>"
@@ -637,7 +753,7 @@ def show_preprocessing():
             fig.update_layout(paper_bgcolor='#FFFFFF', plot_bgcolor='#F8FAFC',
                               font={'color':'#1E293B'}, height=360,
                               yaxis={'gridcolor':'#E2E8F0'})
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key="ph1_feat_box")
         if 'Rating' in df.columns:
             import plotly.graph_objects as go
             rat_cnt = df['Rating'].value_counts().sort_index()
@@ -649,7 +765,7 @@ def show_preprocessing():
             fig2.update_layout(title='Rating Distribution', paper_bgcolor='#FFFFFF',
                                 plot_bgcolor='#F8FAFC', font={'color':'#1E293B'},
                                 yaxis={'gridcolor':'#E2E8F0'}, height=300)
-            st.plotly_chart(fig2, use_container_width=True)
+            st.plotly_chart(fig2, use_container_width=True, key="ph1_rating_bar")
     with tab3:
         st.markdown("""
 **E-Commerce Slang Normalisation Examples**
@@ -728,23 +844,23 @@ where `compound ∈ [−1, +1]` from VADER.
     with g1:
         gauge = M['create_dissatisfaction_gauge'](
             kpis.get('overall_dissatisfaction_index', 0))
-        st.plotly_chart(gauge, use_container_width=True)
+        st.plotly_chart(gauge, use_container_width=True, key="ph2v_gauge")
     with g2:
         pie = M['create_sentiment_distribution'](df)
-        st.plotly_chart(pie, use_container_width=True)
+        st.plotly_chart(pie, use_container_width=True, key="ph2v_sentiment_pie")
 
     st.markdown("---")
     col1,col2 = st.columns(2)
     with col1:
         hist = M['create_dissatisfaction_histogram'](df)
-        st.plotly_chart(hist, use_container_width=True)
+        st.plotly_chart(hist, use_container_width=True, key="ph2v_dis_hist")
     with col2:
         scatter = M['create_scatter_compound_vs_rating'](df)
-        st.plotly_chart(scatter, use_container_width=True)
+        st.plotly_chart(scatter, use_container_width=True, key="ph2v_scatter")
 
     st.markdown("---")
     dept_bar = M['create_department_sentiment_bar'](df)
-    st.plotly_chart(dept_bar, use_container_width=True)
+    st.plotly_chart(dept_bar, use_container_width=True, key="ph2v_dept_bar")
 
     # ── Department breakdown table ────────────────────────────────────────────
     if 'dissatisfaction_by_department' in kpis:
@@ -846,7 +962,7 @@ each review as a mixture of topics and each topic as a distribution of words.
         pivot = get_topic_dissatisfaction_matrix(df)
         if not pivot.empty:
             hmap = M['create_topic_heatmap'](pivot)
-            st.plotly_chart(hmap, use_container_width=True)
+            st.plotly_chart(hmap, use_container_width=True, key="ph2t_hmap")
             st.markdown("""
 > **How to read:** Each cell shows the **average dissatisfaction score** for reviews
 > assigned to that topic at that star rating. Darker red = more dissatisfied.
@@ -858,7 +974,7 @@ each review as a mixture of topics and each topic as a distribution of words.
         col1, col2 = st.columns(2)
         with col1:
             topic_bar = M['create_topic_bar'](df)
-            st.plotly_chart(topic_bar, use_container_width=True)
+            st.plotly_chart(topic_bar, use_container_width=True, key="ph2t_topic_bar")
         with col2:
             import plotly.express as px
             if 'topic_label' in df.columns:
@@ -867,7 +983,7 @@ each review as a mixture of topics and each topic as a distribution of words.
                              title='Topic Share of All Reviews')
                 fig.update_layout(paper_bgcolor='#FFFFFF', height=320,
                                   font={'color':'#1E293B'})
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, use_container_width=True, key="ph2t_topic_pie")
 
     with tab4:
         topic_filter = st.selectbox("Filter by topic", ['All'] + list(topic_kws.keys()))
@@ -926,10 +1042,17 @@ VADER scores this **positive** (love, great). RoBERTa correctly flags it as **ir
                     progress_bar.progress(current / total_val,
                                           text=f"Processed {current}/{total_val} reviews…")
                 with st.spinner("🔄 Running batch inference…"):
+                    compounds = (sample_df['compound'] if 'compound' in sample_df.columns
+                                 else None)
                     sarcasm_df = M['batch_detect_sarcasm'](
                         sample_df['Review Text'], pipe,
+                        compounds=compounds,
                         progress_callback=update_progress)
                     sample_df = sample_df.reset_index(drop=True)
+                    if sarcasm_df is None or sarcasm_df.empty:
+                        st.error("❌ Sarcasm detection returned no results. Please retry.")
+                        return
+                    sarcasm_df = sarcasm_df.reset_index(drop=True)
                     df_sarcasm = pd.concat([sample_df, sarcasm_df], axis=1)
                     kpis = M['get_sarcasm_kpis'](df_sarcasm)
                     st.session_state.df_sarcasm = df_sarcasm
@@ -961,17 +1084,20 @@ RoBERTa's bidirectional attention mechanism captures this contextual irony.</p>
     col1, col2 = st.columns(2)
     with col1:
         donut = M['create_sarcasm_donut'](df)
-        st.plotly_chart(donut, use_container_width=True)
+        st.plotly_chart(donut, use_container_width=True, key="ph2s_donut")
     with col2:
         hist = M['create_irony_prob_histogram'](df)
-        st.plotly_chart(hist, use_container_width=True)
+        st.plotly_chart(hist, use_container_width=True, key="ph2s_irony_hist")
 
     st.markdown("---")
     st.markdown("### 🔍 Sarcastic Reviews Detected")
-    sarcastic = df[df['is_sarcastic']].sort_values('irony_prob', ascending=False)
-    show_cols = [c for c in ['Review Text','Rating','irony_prob','compound',
-                              'dissatisfaction_score','Department Name'] if c in sarcastic.columns]
-    st.dataframe(sarcastic[show_cols].head(30), use_container_width=True, height=380)
+    if 'is_sarcastic' not in df.columns:
+        st.warning("⚠️ Sarcasm column not found in results. Please re-run detection.")
+    else:
+        sarcastic = df[df['is_sarcastic']].sort_values('irony_prob', ascending=False)
+        show_cols = [c for c in ['Review Text','Rating','irony_prob','compound',
+                                  'dissatisfaction_score','Department Name'] if c in sarcastic.columns]
+        st.dataframe(sarcastic[show_cols].head(30), use_container_width=True, height=380)
 
     st.markdown("---")
     st.markdown("### 💡 VADER vs RoBERTa Disagreement Analysis")
@@ -1029,13 +1155,13 @@ def show_dashboard():
             gauge = M['create_dissatisfaction_gauge'](
                 kpis.get('overall_dissatisfaction_index', 0),
                 "Overall Dissatisfaction Index")
-            st.plotly_chart(gauge, use_container_width=True)
+            st.plotly_chart(gauge, use_container_width=True, key="dash_gauge")
         with col2:
             rating_fig = M['create_rating_distribution'](df)
-            st.plotly_chart(rating_fig, use_container_width=True)
+            st.plotly_chart(rating_fig, use_container_width=True, key="dash_rating_dist")
         with col3:
             pie_fig = M['create_sentiment_distribution'](df)
-            st.plotly_chart(pie_fig, use_container_width=True)
+            st.plotly_chart(pie_fig, use_container_width=True, key="dash_sentiment_pie")
 
     st.markdown("---")
 
@@ -1046,7 +1172,7 @@ def show_dashboard():
         pivot = get_topic_dissatisfaction_matrix(df)
         if not pivot.empty:
             hmap = M['create_topic_heatmap'](pivot)
-            st.plotly_chart(hmap, use_container_width=True)
+            st.plotly_chart(hmap, use_container_width=True, key="dash_hmap")
             st.markdown("""
 > **Business Insight:** Red cells represent the highest-dissatisfaction combinations.
 > Action these topic × rating intersections first to reduce customer churn.
@@ -1059,10 +1185,10 @@ def show_dashboard():
     col1, col2 = st.columns(2)
     with col1:
         dept_fig = M['create_department_sentiment_bar'](df)
-        st.plotly_chart(dept_fig, use_container_width=True)
+        st.plotly_chart(dept_fig, use_container_width=True, key="dash_dept_bar")
     with col2:
         age_fig = M['create_age_sentiment_box'](df)
-        st.plotly_chart(age_fig, use_container_width=True)
+        st.plotly_chart(age_fig, use_container_width=True, key="dash_age_box")
 
     st.markdown("---")
 
@@ -1104,14 +1230,14 @@ def show_dashboard():
         col1, col2 = st.columns(2)
         with col1:
             scatter = M['create_scatter_compound_vs_rating'](df)
-            st.plotly_chart(scatter, use_container_width=True)
+            st.plotly_chart(scatter, use_container_width=True, key="dash_scatter")
         with col2:
             if st.session_state.topic_done:
                 topic_bar = M['create_topic_bar'](df)
-                st.plotly_chart(topic_bar, use_container_width=True)
+                st.plotly_chart(topic_bar, use_container_width=True, key="dash_topic_bar")
             else:
                 hist = M['create_dissatisfaction_histogram'](df)
-                st.plotly_chart(hist, use_container_width=True)
+                st.plotly_chart(hist, use_container_width=True, key="dash_dis_hist")
 
     st.markdown("---")
 
@@ -1123,7 +1249,7 @@ def show_dashboard():
         col1, col2 = st.columns(2)
         with col1:
             donut = M['create_sarcasm_donut'](sc_df)
-            st.plotly_chart(donut, use_container_width=True)
+            st.plotly_chart(donut, use_container_width=True, key="dash_sarcasm_donut")
         with col2:
             sc1, sc2, sc3 = st.columns(3)
             sc1.metric("Sarcasm Rate", f"{sarcasm_kpis.get('sarcasm_rate_pct',0)}%")
