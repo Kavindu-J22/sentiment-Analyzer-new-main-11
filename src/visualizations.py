@@ -173,6 +173,12 @@ def create_scatter_compound_vs_rating(df: pd.DataFrame) -> go.Figure:
     """Scatter plot: VADER compound score vs star rating."""
     if 'compound' not in df.columns:
         return go.Figure()
+    # 'Rating' is optional — uploaded CSVs may not have it
+    if 'Rating' not in df.columns:
+        fig = go.Figure()
+        fig.update_layout(title='Rating column not available in uploaded dataset',
+                          paper_bgcolor=PALETTE['card'], font={'color': PALETTE['text']}, height=350)
+        return fig
     sample = df.sample(min(2000, len(df)), random_state=42)
     fig = px.scatter(sample, x='Rating', y='compound',
                      color='sentiment_class',

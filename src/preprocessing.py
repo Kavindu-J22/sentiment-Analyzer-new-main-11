@@ -114,34 +114,44 @@ def preprocess_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Add derived feature columns for analysis."""
+    """Add derived feature columns for analysis. Works with any CSV that has 'Review Text'."""
     df['review_length'] = df['Review Text'].str.len()
     df['word_count'] = df['Review Text'].str.split().str.len()
-    df['has_title'] = df['Title'].notna().astype(int)
+    # 'Title' column is optional (present in built-in dataset, may be absent in uploads)
+    if 'Title' in df.columns:
+        df['has_title'] = df['Title'].notna().astype(int)
+    else:
+        df['has_title'] = 0
     df['exclamation_count'] = df['Review Text'].str.count(r'\!')
     df['question_count'] = df['Review Text'].str.count(r'\?')
     df['uppercase_ratio'] = (
         df['Review Text'].apply(lambda x: sum(1 for c in str(x) if c.isupper()))
         / df['review_length'].replace(0, 1)
     )
-    df['sentiment_label'] = df['Rating'].map({
-        1: 'Very Negative', 2: 'Negative',
-        3: 'Neutral', 4: 'Positive', 5: 'Very Positive'
-    })
-    df['is_negative'] = (df['Rating'] <= 2).astype(int)
+    # 'Rating' column is optional — uploaded CSVs may not have star ratings
+    if 'Rating' in df.columns:
+        df['sentiment_label'] = df['Rating'].map({
+            1: 'Very Negative', 2: 'Negative',
+            3: 'Neutral', 4: 'Positive', 5: 'Very Positive'
+        })
+        df['is_negative'] = (df['Rating'] <= 2).astype(int)
+    else:
+        df['sentiment_label'] = 'Unknown'
+        df['is_negative'] = 0
     return df
 
 
 def get_preprocessing_stats(original: pd.DataFrame, processed: pd.DataFrame) -> dict:
     """Return a summary dict comparing raw vs processed data."""
+    has_is_negative = 'is_negative' in processed.columns
     return {
         'original_rows': len(original),
         'processed_rows': len(processed),
         'rows_removed': len(original) - len(processed),
-        'null_reviews_dropped': original['Review Text'].isna().sum(),
+        'null_reviews_dropped': int(original['Review Text'].isna().sum()),
         'avg_word_count': round(processed['word_count'].mean(), 1),
         'avg_review_length': round(processed['review_length'].mean(), 1),
-        'negative_reviews': int(processed['is_negative'].sum()),
-        'negative_pct': round(processed['is_negative'].mean() * 100, 1),
+        'negative_reviews': int(processed['is_negative'].sum()) if has_is_negative else 'N/A',
+        'negative_pct': round(processed['is_negative'].mean() * 100, 1) if has_is_negative else 0,
     }
 
