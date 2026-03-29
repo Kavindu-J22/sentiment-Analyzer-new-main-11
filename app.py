@@ -178,6 +178,7 @@ _STATE_DEFAULTS = {
     'preprocessing_done': False, 'vader_done': False,
     'topic_done': False, 'sarcasm_done': False,
     'kpis': {}, 'topic_keywords': {},
+    'live_results': None,  # stores per-review live analysis results
 }
 for k, v in _STATE_DEFAULTS.items():
     if k not in st.session_state:
@@ -360,21 +361,215 @@ def show_data_hub():
                         st.session_state[k] = False
                     st.success(f"✅ Uploaded {len(df):,} rows!")
 
-    else:  # Live text
-        live_text = st.text_area("Paste one or more reviews (one per line)", height=200,
-                                  placeholder="e.g.\nI love this dress!\nThe quality is terrible and it runs very small.")
-        if st.button("🔍 Analyse Live Reviews"):
+    else:  # ── Live Review Text Analysis ──────────────────────────────────────
+        st.markdown("""<div class='insight-box'>
+<h4>🔬 Live Analysis Mode</h4>
+<p>Enter one or more reviews below (one per line). Optionally fill in your <b>Expected Topic</b>
+and <b>Expected Sentiment</b> columns so the system can validate its predictions against your
+own human judgment — great for testing accuracy!</p>
+</div>""", unsafe_allow_html=True)
+
+        col_r, col_t, col_s = st.columns([3, 2, 2])
+        with col_r:
+            live_text = st.text_area(
+                "📝 Reviews — one per line",
+                height=210,
+                placeholder="e.g.\nThe package arrived two weeks late and was completely damaged.\nThe fabric smells like chemicals and falls apart after one wash.\nI love this dress, it fits perfectly and looks gorgeous!")
+        with col_t:
+            exp_topics_raw = st.text_area(
+                "🏷️ Expected Topic (one per line, optional)",
+                height=210,
+                placeholder="e.g.\nDelivery & Shipping\nProduct Quality\nStyle & Design")
+        with col_s:
+            exp_sents_raw = st.text_area(
+                "💬 Expected Sentiment (one per line, optional)",
+                height=210,
+                placeholder="e.g.\nNegative\nNeutral-Negative (Mixed)\nPositive")
+
+        st.caption("💡 **Available Topics:** Delivery & Shipping · Fit & Size · Product Quality · Customer Service · Value for Money · Style & Design")
+        st.caption("💡 **Available Sentiments:** Positive · Neutral-Positive (Mixed) · Neutral · Neutral-Negative (Mixed) · Negative")
+
+        if st.button("🔍 Analyse Live Reviews", type="primary"):
             lines = [l.strip() for l in live_text.strip().split('\n') if l.strip()]
-            if lines:
-                df = pd.DataFrame({'Review Text': lines, 'Rating': 3,
-                                   'Department Name': 'Unknown', 'Age': 35,
-                                   'Recommended IND': 0, 'Positive Feedback Count': 0,
-                                   'Division Name': 'Unknown',
-                                   'Department Name': 'Unknown', 'Class Name': 'Unknown'})
-                st.session_state.df_raw = df
+            exp_topics = ([l.strip() for l in exp_topics_raw.strip().split('\n') if l.strip()]
+                          if exp_topics_raw.strip() else [])
+            exp_sents  = ([l.strip() for l in exp_sents_raw.strip().split('\n') if l.strip()]
+                          if exp_sents_raw.strip() else [])
+            if not lines:
+                st.warning("⚠️ Please enter at least one review.")
+            else:
+                # ── Keyword-based topic classifier (works on single reviews) ──
+                LIVE_TOPIC_KW = {
+                    '🚚 Delivery & Shipping': [
+                        'delivery','shipping','ship','shipped','arrived','package','parcel',
+                        'courier','late','delay','delayed','damaged','tracking','lost',
+                        'dispatch','warehouse','customs','transit'],
+                    '📏 Fit & Size': [
+                        'size','fit','fits','fitting','sized','small','large','tight','loose',
+                        'runs','petite','length','short','long','wide','measurements','waist',
+                        'chest','hips','narrow','baggy','oversized','snug'],
+                    '🏷️ Product Quality': [
+                        'quality','material','fabric','thin','thick','cheap','durable',
+                        'stitching','seam','faded','shrunk','pilling','itchy','smell',
+                        'chemical','worn','washing','texture','thread','flimsy','scratchy',
+                        'fraying','peeling','broke','defective','damaged'],
+                    '🤝 Customer Service': [
+                        'service','return','returned','refund','exchange','support','staff',
+                        'helpful','rude','response','customer','complaint','policy',
+                        'representative','contacted','chat','email','resolution','helpdesk'],
+                    '💰 Value for Money': [
+                        'price','expensive','cheap','worth','value','overpriced','money','cost',
+                        'pay','afford','budget','discount','deal','pricey','markup','priced'],
+                    '🎨 Style & Design': [
+                        'style','design','pattern','beautiful','elegant','cute','pretty',
+                        'gorgeous','look','fashionable','aesthetic','color','colour','print',
+                        'chic','trendy','flattering','lovely','adorable'],
+                }
+
+                def _predict_topic(text: str) -> str:
+                    t = text.lower()
+                    scores = {topic: sum(1 for kw in kws if kw in t)
+                              for topic, kws in LIVE_TOPIC_KW.items()}
+                    best = max(scores, key=scores.get)
+                    return best if scores[best] > 0 else '🏷️ Product Quality'
+
+                def _predict_sentiment_label(compound: float) -> str:
+                    if compound >= 0.5:    return 'Positive'
+                    elif compound >= 0.1:  return 'Neutral-Positive (Mixed)'
+                    elif compound >= -0.1: return 'Neutral'
+                    elif compound >= -0.5: return 'Neutral-Negative (Mixed)'
+                    else:                  return 'Negative'
+
+                def _match_icon(expected: str, predicted: str) -> str:
+                    if expected == '—':
+                        return '—'
+                    for word in expected.lower().split():
+                        if len(word) > 3 and word in predicted.lower():
+                            return '✅ Match'
+                    return '⚠️ Mismatch'
+
+                with st.spinner("🔄 Running Hybrid NLP Pipeline (VADER + Keyword-LDA)…"):
+                    temp_df = pd.DataFrame({
+                        'Review Text': lines, 'Rating': 3,
+                        'Department Name': 'Unknown', 'Age': 35,
+                        'Recommended IND': 0, 'Positive Feedback Count': 0,
+                        'Division Name': 'Unknown', 'Class Name': 'Unknown'})
+                    vader_df = M['batch_analyze_vader'](temp_df)
+
+                    live_records = []
+                    for i, row in vader_df.iterrows():
+                        pred_topic = _predict_topic(str(row['Review Text']))
+                        pred_sent  = _predict_sentiment_label(float(row['compound']))
+                        live_records.append({
+                            'review':                str(row['Review Text']),
+                            'exp_topic':             exp_topics[i] if i < len(exp_topics) else '—',
+                            'exp_sentiment':         exp_sents[i]  if i < len(exp_sents)  else '—',
+                            'pred_topic':            pred_topic,
+                            'pred_sentiment':        pred_sent,
+                            'dissatisfaction_class': str(row['sentiment_class']),
+                            'dissatisfaction_score': float(row['dissatisfaction_score']),
+                            'compound':              float(row['compound']),
+                            'vader_pos':             float(row['vader_pos']),
+                            'vader_neu':             float(row['vader_neu']),
+                            'vader_neg':             float(row['vader_neg']),
+                        })
+
+                st.session_state.df_raw = temp_df
+                st.session_state.live_results = live_records
                 for k in ['preprocessing_done','vader_done','topic_done','sarcasm_done']:
                     st.session_state[k] = False
-                st.success(f"✅ Ready to analyse {len(df)} review(s)!")
+                st.success(f"✅ Analysed {len(live_records)} review(s) — see detailed results below!")
+                st.rerun()
+
+        # ── Live Results Display ──────────────────────────────────────────────
+        if st.session_state.get('live_results'):
+            results = st.session_state.live_results
+
+            def _match_icon_display(expected: str, predicted: str) -> str:
+                if expected == '—':
+                    return '—'
+                for word in expected.lower().split():
+                    if len(word) > 3 and word in predicted.lower():
+                        return '✅ Match'
+                return '⚠️ Mismatch'
+
+            st.markdown("---")
+            st.markdown("### 🔬 Live Analysis Results")
+            st.markdown(f"**{len(results)} review(s) analysed** using VADER + Keyword-based Topic Classifier")
+
+            # ── Summary comparison table ──────────────────────────────────────
+            table_rows = []
+            for r in results:
+                table_rows.append({
+                    'Review (excerpt)':   (r['review'][:60]+'…' if len(r['review'])>60 else r['review']),
+                    'Predicted Topic':    r['pred_topic'],
+                    'Expected Topic':     r['exp_topic'],
+                    'Topic ✓':            _match_icon_display(r['exp_topic'],    r['pred_topic']),
+                    'Predicted Sentiment':r['pred_sentiment'],
+                    'Expected Sentiment': r['exp_sentiment'],
+                    'Sentiment ✓':        _match_icon_display(r['exp_sentiment'], r['pred_sentiment']),
+                    'Score /100':         f"{r['dissatisfaction_score']:.1f}",
+                    'Severity Class':     r['dissatisfaction_class'],
+                })
+            st.dataframe(pd.DataFrame(table_rows), use_container_width=True, height=min(200 + len(results)*40, 420))
+
+            # ── Per-review detail cards ───────────────────────────────────────
+            st.markdown("#### 📋 Detailed Per-Review Breakdown")
+            for i, r in enumerate(results):
+                score  = r['dissatisfaction_score']
+                badge_color = ('#DC2626' if score >= 70 else '#EA580C' if score >= 45
+                               else '#CA8A04' if score >= 20 else '#059669')
+                topic_match = _match_icon_display(r['exp_topic'],    r['pred_topic'])
+                sent_match  = _match_icon_display(r['exp_sentiment'], r['pred_sentiment'])
+
+                with st.expander(
+                    f"📄 Review {i+1}  |  Dissatisfaction: {score:.0f}/100  |  {r['dissatisfaction_class']}",
+                    expanded=(len(results) <= 4)):
+                    c1, c2, c3 = st.columns([3, 2, 2])
+
+                    with c1:
+                        st.markdown("**📝 Full Review Text:**")
+                        st.info(r['review'])
+
+                    with c2:
+                        exp_t_html = (f"<br><small style='color:#64748B'>▸ Your Expected: "
+                                      f"<b>{r['exp_topic']}</b> &nbsp; {topic_match}</small>"
+                                      if r['exp_topic'] != '—' else "")
+                        exp_s_html = (f"<br><small style='color:#64748B'>▸ Your Expected: "
+                                      f"<b>{r['exp_sentiment']}</b> &nbsp; {sent_match}</small>"
+                                      if r['exp_sentiment'] != '—' else "")
+                        st.markdown(f"""
+**🏷️ Predicted Topic**
+<span style='font-size:1.05rem;font-weight:700;color:#4F46E5'>{r['pred_topic']}</span>
+{exp_t_html}
+
+**💬 Predicted Sentiment**
+<span style='font-size:1.05rem;font-weight:700;color:#4F46E5'>{r['pred_sentiment']}</span>
+{exp_s_html}
+
+**🏷️ Severity Class**
+<span style='font-size:1.05rem;font-weight:700;color:{badge_color}'>{r['dissatisfaction_class']}</span>
+""", unsafe_allow_html=True)
+
+                    with c3:
+                        st.markdown("**📊 VADER Score Breakdown**")
+                        st.markdown(f"""
+| Dimension | Score |
+|-----------|-------|
+| 🟢 Positive | `{r['vader_pos']:.3f}` |
+| ⚪ Neutral  | `{r['vader_neu']:.3f}` |
+| 🔴 Negative | `{r['vader_neg']:.3f}` |
+| ⚡ Compound | `{r['compound']:+.4f}` |
+""")
+                        st.markdown(
+                            f"<div style='background:{badge_color};color:#fff;padding:12px 16px;"
+                            f"border-radius:10px;text-align:center;margin-top:6px;'>"
+                            f"<div style='font-size:0.8rem;opacity:0.9'>Dissatisfaction Score</div>"
+                            f"<div style='font-size:2.2rem;font-weight:900;line-height:1.1'>"
+                            f"{score:.0f}<span style='font-size:1rem'>/100</span></div>"
+                            f"<div style='font-size:0.75rem;opacity:0.85;margin-top:2px'>"
+                            f"{r['dissatisfaction_class']}</div></div>",
+                            unsafe_allow_html=True)
 
     if st.session_state.df_raw is not None:
         df = st.session_state.df_raw
