@@ -1,3 +1,9 @@
 /Project.md
 /DOCUMENTATION.md
-venv
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+*.egg-info/
+.env
